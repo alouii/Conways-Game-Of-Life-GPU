@@ -3,95 +3,95 @@
 #include <vector>
 #include <cstdlib>
 #include <ctime>
+#include <cstdint>
 
-#define WIDTH 1024
+#define WIDTH 1024       // Must be multiple of 32 for simplicity
 #define HEIGHT 1024
 #define STEPS 100
-#define TILE_SIZE 16  // Block size
 
-// CUDA kernel using shared memory
-__global__ void gameOfLifeShared(int* current, int* next, int width, int height) {
-    __shared__ int tile[TILE_SIZE + 2][TILE_SIZE + 2]; // +2 for halo cells
+using Word = uint32_t;
+constexpr int WORD_SIZE = 32;
 
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int x = blockIdx.x * blockDim.x + tx;
-    int y = blockIdx.y * blockDim.y + ty;
+// Helper to get bit
+__device__ inline int getBit(Word w, int pos) {
+    return (w >> pos) & 1;
+}
 
-    // Load cells into shared memory with wrap-around
-    int xm1 = (x - 1 + width) % width;
-    int xp1 = (x + 1) % width;
-    int ym1 = (y - 1 + height) % height;
-    int yp1 = (y + 1) % height;
+// Helper to set bit
+__device__ inline void setBit(Word &w, int pos, int val) {
+    w &= ~(1u << pos);
+    w |= (val << pos);
+}
 
-    if (x < width && y < height) {
-        tile[ty + 1][tx + 1] = current[y * width + x];
+// CUDA kernel for bit-packed Game of Life
+__global__ void gameOfLifeBitPacked(const Word* current, Word* next, int widthWords, int height) {
+    int xWord = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-        // Load halo cells
-        if (tx == 0) tile[ty + 1][0] = current[y * width + xm1];
-        if (tx == TILE_SIZE - 1) tile[ty + 1][TILE_SIZE + 1] = current[y * width + xp1];
-        if (ty == 0) tile[0][tx + 1] = current[ym1 * width + x];
-        if (ty == TILE_SIZE - 1) tile[TILE_SIZE + 1][tx + 1] = current[yp1 * width + x];
+    if (xWord >= widthWords || y >= height) return;
 
-        // Corner halos
-        if (tx == 0 && ty == 0) tile[0][0] = current[ym1 * width + xm1];
-        if (tx == TILE_SIZE - 1 && ty == 0) tile[0][TILE_SIZE + 1] = current[ym1 * width + xp1];
-        if (tx == 0 && ty == TILE_SIZE - 1) tile[TILE_SIZE + 1][0] = current[yp1 * width + xm1];
-        if (tx == TILE_SIZE - 1 && ty == TILE_SIZE - 1) tile[TILE_SIZE + 1][TILE_SIZE + 1] = current[yp1 * width + xp1];
-    }
+    Word newWord = 0;
 
-    __syncthreads();
+    for (int bit = 0; bit < WORD_SIZE; ++bit) {
+        int x = xWord * WORD_SIZE + bit;
 
-    if (x >= width || y >= height) return;
-
-    // Count neighbors
-    int count = 0;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            if (dx == 0 && dy == 0) continue;
-            count += tile[ty + 1 + dy][tx + 1 + dx];
+        int count = 0;
+        // iterate over neighbors
+        for (int dy = -1; dy <= 1; ++dy) {
+            int ny = (y + dy + height) % height;
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                int nx = (x + dx + WIDTH) % WIDTH;
+                int nWord = nx / WORD_SIZE;
+                int nBit = nx % WORD_SIZE;
+                count += getBit(current[ny * widthWords + nWord], nBit);
+            }
         }
+
+        int idx = y * widthWords + xWord;
+        int currentCell = getBit(current[idx], bit);
+        int newCell = (currentCell && (count == 2 || count == 3)) || (!currentCell && count == 3);
+        setBit(newWord, bit, newCell);
     }
 
-    int idx = y * width + x;
-    if (tile[ty + 1][tx + 1] == 1 && (count == 2 || count == 3)) next[idx] = 1;
-    else if (tile[ty + 1][tx + 1] == 0 && count == 3) next[idx] = 1;
-    else next[idx] = 0;
+    next[y * widthWords + xWord] = newWord;
 }
 
 int main() {
-    std::vector<int> h_grid(WIDTH * HEIGHT);
+    int widthWords = WIDTH / WORD_SIZE;
+    std::vector<Word> h_grid(WIDTH / WORD_SIZE * HEIGHT);
     srand(time(0));
 
-    // Initialize grid randomly
-    for (int i = 0; i < WIDTH * HEIGHT; ++i)
-        h_grid[i] = rand() % 2;
+    // Random initialization
+    for (auto &w : h_grid) w = rand();
 
-    int *d_current, *d_next;
-    cudaMalloc(&d_current, WIDTH * HEIGHT * sizeof(int));
-    cudaMalloc(&d_next, WIDTH * HEIGHT * sizeof(int));
+    Word *d_current, *d_next;
+    cudaMalloc(&d_current, h_grid.size() * sizeof(Word));
+    cudaMalloc(&d_next, h_grid.size() * sizeof(Word));
+    cudaMemcpy(d_current, h_grid.data(), h_grid.size() * sizeof(Word), cudaMemcpyHostToDevice);
 
-    cudaMemcpy(d_current, h_grid.data(), WIDTH * HEIGHT * sizeof(int), cudaMemcpyHostToDevice);
-
-    dim3 threadsPerBlock(TILE_SIZE, TILE_SIZE);
-    dim3 numBlocks((WIDTH + TILE_SIZE - 1) / TILE_SIZE, (HEIGHT + TILE_SIZE - 1) / TILE_SIZE);
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((widthWords + 15) / 16, (HEIGHT + 15) / 16);
 
     for (int step = 0; step < STEPS; ++step) {
-        gameOfLifeShared<<<numBlocks, threadsPerBlock>>>(d_current, d_next, WIDTH, HEIGHT);
+        gameOfLifeBitPacked<<<numBlocks, threadsPerBlock>>>(d_current, d_next, widthWords, HEIGHT);
         cudaDeviceSynchronize();
         std::swap(d_current, d_next);
     }
 
-    cudaMemcpy(h_grid.data(), d_current, WIDTH * HEIGHT * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_grid.data(), d_current, h_grid.size() * sizeof(Word), cudaMemcpyDeviceToHost);
 
-    // Print a small part of the grid
-    for (int y = 0; y < 10; ++y) {
-        for (int x = 0; x < 10; ++x) std::cout << h_grid[y * WIDTH + x] << " ";
+    // Print first 64 cells
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 64; ++x) {
+            int w = x / WORD_SIZE;
+            int b = x % WORD_SIZE;
+            std::cout << ((h_grid[y * widthWords + w] >> b) & 1);
+        }
         std::cout << std::endl;
     }
 
     cudaFree(d_current);
     cudaFree(d_next);
-
     return 0;
 }
